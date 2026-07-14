@@ -24,13 +24,13 @@ logger = logging.getLogger("safeharbor.phi")
 # ============================================================
 
 REGEX_PATTERNS = {
-    "SSN": (r"\d{3}-\d{2}-\d{4}", "[REDACTED_SSN]"),
-    "MRN": (r"MRN[\s:#]*\d+", "MRN [REDACTED_MRN]"),
+    "SSN": (r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED_SSN]"),
+    "MRN": (r"\bMRN[\s:#]*\d{5,}\b", "MRN [REDACTED_MRN]"),
     "DOB": (
-        r"(?:DOB|date\s*of\s*birth)[\s:]*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
+        r"\b(?:DOB|date\s*of\s*birth)[\s:]*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
         "DOB [REDACTED_DOB]",
     ),
-    "PHONE": (r"\d{3}[-.)]\s*\d{3}[-.)]\s*\d{4}", "[REDACTED_PHONE]"),
+    "PHONE": (r"\b\d{3}[-.)]\s*\d{3}[-.)]\s*\d{4}\b", "[REDACTED_PHONE]"),
     "EMAIL": (
         r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
         "[REDACTED_EMAIL]",
