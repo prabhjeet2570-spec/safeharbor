@@ -1,0 +1,6 @@
+# SafeHarbor - proxy-side dependencies
+#
+# Install:
+#     pip install -r requirements.txt
+
+mitmproxy>=10.0
