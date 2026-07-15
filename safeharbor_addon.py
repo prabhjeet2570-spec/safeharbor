@@ -13,10 +13,16 @@ import re
 import time
 from datetime import datetime
 
+# Import the PHI redactor
+from phi_redactor import PHIRedactor
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
+# PHI engine: "regex" (default) or "ollama" (requires local Ollama with llama3.2:3b)
+PHI_ENGINE = "regex"
 
 # Known AI service domains → friendly names
 AI_DOMAINS = {
@@ -246,7 +252,8 @@ def print_event(flow, service, risk, body):
 
 class SafeHarbor:
     def __init__(self):
-        ctx.log.info("SafeHarbor addon loaded")
+        self.redactor = PHIRedactor(use_presidio=False, use_ollama=(PHI_ENGINE == "ollama"))
+        ctx.log.info("SafeHarbor initialized with PHI redactor")
 
     def request(self, flow: mitmproxy.http.HTTPFlow):
         host = flow.request.pretty_host
@@ -303,10 +310,92 @@ class SafeHarbor:
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Score the request and print it. Not touching the body yet —
-        # right now this is observe-only.
+        # ── PHI Detection & Redaction via Presidio ─────────────────
+        phi_result = self.redactor.analyze_and_redact(readable_body)
+
+        # Score the risk (uses regex internally for keywords/size)
         risk = score_risk(readable_body, matched_service, flow.request.method)
+        # Override PHI findings with Presidio results (more accurate)
+        risk["phi_detected"] = phi_result["phi_detected"]
+        risk["phi_count"] = phi_result["phi_count"]
+        risk["phi_findings"] = {}
+        for f in phi_result["findings"]:
+            etype = f["entity_type"]
+            risk["phi_findings"][etype] = risk["phi_findings"].get(etype, 0) + 1
+        # Boost score based on Presidio entity count
+        if phi_result["phi_detected"]:
+            risk["score"] = min(
+                risk["score"] + len(phi_result["entity_types_found"]) * 12, 100
+            )
+
+        # Print the intercept event
         print_event(flow, matched_service, risk, readable_body)
+
+        # ── Action: Redact & Forward ──────────────────────────────
+        if phi_result["phi_detected"]:
+            redacted_text = phi_result["redacted_text"]
+
+            # Show redaction details in terminal
+            print(f"\n  {'=' * 56}")
+            print(f"  ✂️  {BOLD}PHI REDACTION APPLIED ({phi_result['engine']}){RESET}")
+            print(f"  {'=' * 56}")
+            for f in phi_result["findings"]:
+                print(f'    🔴 {f["entity_type"]}: "{f["text"]}" → [REDACTED]')
+            print(f"\n  📝 {BOLD}REDACTED MESSAGE:{RESET}")
+            print(f"  ┌{'─' * 56}┐")
+            for line in redacted_text[:600].split("\n"):
+                while len(line) > 54:
+                    print(f"  │ {line[:54]} │")
+                    line = line[54:]
+                print(f"  │ {line:<54} │")
+            print(f"  └{'─' * 56}┘")
+            print(
+                f"\n  ✅ {BOLD}\033[92mForwarding REDACTED request to {matched_service}{RESET}"
+            )
+            print(f"  {'=' * 56}\n")
+
+            # Rewrite the request body with redacted content
+            try:
+                original_json = json.loads(raw_body)
+                modified_json = self._replace_content(original_json, redacted_text)
+                flow.request.set_text(json.dumps(modified_json))
+            except (json.JSONDecodeError, TypeError) as e:
+                ctx.log.warn(f"Could not rewrite JSON body: {e}")
+
+            # Tag headers
+            flow.request.headers["X-SafeHarbor"] = "redacted"
+            flow.request.headers["X-SafeHarbor-Risk"] = str(risk["score"])
+            flow.request.headers["X-SafeHarbor-PHI-Count"] = str(
+                phi_result["phi_count"]
+            )
+
+        else:
+            # No PHI — clean pass-through
+            print(f"\n  ✅ {BOLD}\033[92mNo PHI — passing through cleanly{RESET}\n")
+            flow.request.headers["X-SafeHarbor"] = "clean"
+            flow.request.headers["X-SafeHarbor-Risk"] = str(risk["score"])
+
+    def _replace_content(self, payload: dict, new_content: str) -> dict:
+        """Replace the user message in the API payload with redacted version."""
+
+        # ChatGPT web format
+        if "action" in payload and "messages" in payload:
+            for msg in payload["messages"]:
+                content = msg.get("content", {})
+                if isinstance(content, dict) and "parts" in content:
+                    content["parts"] = [new_content]
+
+        # OpenAI API format
+        elif "messages" in payload:
+            for msg in payload["messages"]:
+                if msg.get("role") == "user":
+                    msg["content"] = new_content
+
+        # Anthropic format
+        elif "prompt" in payload:
+            payload["prompt"] = new_content
+
+        return payload
 
 
 addons = [SafeHarbor()]
