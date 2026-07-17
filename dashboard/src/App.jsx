@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Header from './components/Header';
 import StatsCards from './components/StatsCards';
 import ThreatFeed from './components/ThreatFeed';
@@ -7,6 +7,7 @@ import RiskHeatmap from './components/RiskHeatmap';
 import NetworkGraph from './components/NetworkGraph';
 import AuditLog from './components/AuditLog';
 import RedactionViewer from './components/RedactionViewer';
+import { useWebSocket } from './hooks/useWebSocket';
 import { fetchStats, fetchEvents } from './lib/api';
 
 const defaultStats = {
@@ -26,7 +27,10 @@ export default function App() {
   const [stats, setStats] = useState(defaultStats);
   const [events, setEvents] = useState([]);
   const [selectedEvent, setSelectedEvent] = useState(null);
+  const [newEventIds, setNewEventIds] = useState(new Set());
+  const newEventTimeouts = useRef(new Map());
 
+  // Load initial data
   useEffect(() => {
     async function loadData() {
       try {
@@ -41,6 +45,78 @@ export default function App() {
       }
     }
     loadData();
+  }, []);
+
+  // Handle WebSocket messages
+  const handleWsMessage = useCallback((msg) => {
+    if (msg.type === 'new_event') {
+      const event = msg.data;
+
+      // Add to events list
+      setEvents((prev) => [event, ...prev]);
+
+      // Update stats incrementally
+      setStats((prev) => ({
+        ...prev,
+        total_requests: prev.total_requests + 1,
+        phi_detected: prev.phi_detected + (event.phi_detected ? 1 : 0),
+        requests_redacted: prev.requests_redacted + (event.action === 'redacted' ? 1 : 0),
+        requests_clean: prev.requests_clean + (event.action === 'clean' ? 1 : 0),
+        avg_risk_score:
+          prev.total_requests > 0
+            ? parseFloat(
+                (
+                  (prev.avg_risk_score * prev.total_requests + (event.risk_score || 0)) /
+                  (prev.total_requests + 1)
+                ).toFixed(1)
+              )
+            : event.risk_score || 0,
+        by_service: {
+          ...prev.by_service,
+          [event.ai_service]: (prev.by_service[event.ai_service] || 0) + 1,
+        },
+        by_severity: {
+          ...prev.by_severity,
+          [event.severity]: (prev.by_severity[event.severity] || 0) + 1,
+        },
+      }));
+
+      // Mark as new for animation
+      setNewEventIds((prev) => {
+        const next = new Set(prev);
+        next.add(event.event_id);
+        return next;
+      });
+
+      // Remove "new" marker after animation completes
+      const timeout = setTimeout(() => {
+        setNewEventIds((prev) => {
+          const next = new Set(prev);
+          next.delete(event.event_id);
+          return next;
+        });
+      }, 2000);
+
+      newEventTimeouts.current.set(event.event_id, timeout);
+    }
+
+    if (msg.type === 'status_update') {
+      const { event_id, status } = msg.data;
+      setEvents((prev) =>
+        prev.map((e) =>
+          e.event_id === event_id ? { ...e, status } : e
+        )
+      );
+    }
+  }, []);
+
+  const { connected } = useWebSocket(handleWsMessage);
+
+  // Cleanup timeouts on unmount
+  useEffect(() => {
+    return () => {
+      newEventTimeouts.current.forEach((t) => clearTimeout(t));
+    };
   }, []);
 
   // Derive stats from PHI-detected events only
@@ -61,15 +137,17 @@ export default function App() {
 
   return (
     <div className="min-h-screen p-4">
-      <Header connected={false} totalEvents={events.length} />
+      <Header connected={connected} totalEvents={events.length} />
 
       <StatsCards stats={phiStats} callStats={{ total_calls: 0, completed_calls: 0, failed_calls: 0 }} />
 
+      {/* Main grid: ThreatFeed | Charts | NetworkGraph */}
       <div className="grid grid-cols-12 gap-4 mb-4">
+        {/* Left: Threat Feed */}
         <div className="col-span-3">
           <ThreatFeed
             events={events}
-            newEventIds={new Set()}
+            newEventIds={newEventIds}
             onSelectEvent={setSelectedEvent}
           />
         </div>
@@ -86,8 +164,10 @@ export default function App() {
         </div>
       </div>
 
+      {/* Bottom: Audit Log */}
       <AuditLog events={events} onSelectEvent={setSelectedEvent} />
 
+      {/* Modal: Redaction Viewer */}
       {selectedEvent && (
         <RedactionViewer
           event={selectedEvent}

@@ -5,16 +5,49 @@ Healthcare Shadow AI Detection & Governance System
 Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db, get_cursor, dict_cursor, close_pool
 from models import EventCreate, EventResponse, StatusUpdate, StatsResponse
 from seed import generate_seed_events, insert_seed_events
+
+
+# ============================================================
+# WebSocket Manager
+# ============================================================
+
+class ConnectionManager:
+    """Manages active WebSocket connections for real-time broadcasts."""
+
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        dead = []
+        for conn in self.active_connections:
+            try:
+                await conn.send_json(message)
+            except Exception:
+                dead.append(conn)
+        for conn in dead:
+            self.disconnect(conn)
+
+
+manager = ConnectionManager()
 
 
 # ============================================================
@@ -88,7 +121,7 @@ def _sanitize(val):
 
 
 @app.post("/api/events", status_code=201)
-def create_event(event: EventCreate):
+async def create_event(event: EventCreate):
     """Ingest a new event from mitmproxy."""
     phi_types_json = json.dumps(event.phi_types) if event.phi_types else json.dumps([])
     phi_findings_json = json.dumps(event.phi_findings) if event.phi_findings else json.dumps([])
@@ -121,6 +154,9 @@ def create_event(event: EventCreate):
         row = cur.fetchone()
 
     created = _row_to_dict(row)
+
+    # Broadcast to WebSocket clients
+    await manager.broadcast({"type": "new_event", "data": created})
 
     return created
 
@@ -171,7 +207,7 @@ def get_event(event_id: str):
 
 
 @app.patch("/api/events/{event_id}/status")
-def update_event_status(event_id: str, body: StatusUpdate):
+async def update_event_status(event_id: str, body: StatusUpdate):
     """Update event status (active/mitigated/resolved)."""
     with get_cursor(cursor_factory=dict_cursor()) as cur:
         cur.execute(
@@ -184,6 +220,12 @@ def update_event_status(event_id: str, body: StatusUpdate):
         raise HTTPException(status_code=404, detail="Event not found")
 
     updated = _row_to_dict(row)
+
+    # Broadcast status change
+    await manager.broadcast({
+        "type": "status_update",
+        "data": {"event_id": event_id, "status": body.status},
+    })
 
     return updated
 
@@ -295,3 +337,19 @@ def seed_database():
         insert_seed_events(cur, events)
 
     return {"message": f"Seeded {len(events)} events", "count": len(events)}
+
+
+# ============================================================
+# WebSocket
+# ============================================================
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, listen for client messages
+            data = await websocket.receive_text()
+            # Echo back as acknowledgment (clients don't need to send anything)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)

@@ -11,6 +11,8 @@ from mitmproxy import ctx
 import json
 import re
 import time
+import urllib.request
+import threading
 from datetime import datetime
 
 # Import the PHI redactor
@@ -250,10 +252,53 @@ def print_event(flow, service, risk, body):
 # ============================================================
 
 
+BACKEND_URL = "http://localhost:8000/api/events"
+
+
 class SafeHarbor:
     def __init__(self):
         self.redactor = PHIRedactor(use_presidio=False, use_ollama=(PHI_ENGINE == "ollama"))
         ctx.log.info("SafeHarbor initialized with PHI redactor")
+
+    def _post_event(self, flow, matched_service, risk, phi_result, readable_body, action):
+        """Post event to the FastAPI backend (non-blocking)."""
+        event = {
+            "source_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
+            "user_agent": flow.request.headers.get("User-Agent", "")[:200],
+            "ai_service": matched_service,
+            "request_method": flow.request.method,
+            "request_path": flow.request.path[:500],
+            "risk_score": risk["score"],
+            "severity": (
+                "critical" if risk["score"] > 70
+                else "high" if risk["score"] > 50
+                else "medium" if risk["score"] > 30
+                else "low" if risk["score"] > 10
+                else "clean"
+            ),
+            "phi_detected": phi_result["phi_detected"],
+            "phi_count": phi_result["phi_count"],
+            "phi_types": phi_result.get("entity_types_found", []),
+            "phi_findings": phi_result.get("findings", []),
+            "original_text": readable_body[:2000],
+            "redacted_text": phi_result.get("redacted_text", "")[:2000] if phi_result["phi_detected"] else None,
+            "action": action,
+            "engine": phi_result.get("engine", "unknown"),
+        }
+
+        def _send():
+            try:
+                data = json.dumps(event).encode("utf-8")
+                req = urllib.request.Request(
+                    BACKEND_URL,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=2)
+            except Exception:
+                pass  # Don't crash the proxy if backend is down
+
+        threading.Thread(target=_send, daemon=True).start()
 
     def request(self, flow: mitmproxy.http.HTTPFlow):
         host = flow.request.pretty_host
@@ -369,11 +414,17 @@ class SafeHarbor:
                 phi_result["phi_count"]
             )
 
+            # Post to backend
+            self._post_event(flow, matched_service, risk, phi_result, readable_body, "redacted")
+
         else:
             # No PHI — clean pass-through
             print(f"\n  ✅ {BOLD}\033[92mNo PHI — passing through cleanly{RESET}\n")
             flow.request.headers["X-SafeHarbor"] = "clean"
             flow.request.headers["X-SafeHarbor-Risk"] = str(risk["score"])
+
+            # Post to backend
+            self._post_event(flow, matched_service, risk, phi_result, readable_body, "clean")
 
     def _replace_content(self, payload: dict, new_content: str) -> dict:
         """Replace the user message in the API payload with redacted version."""
