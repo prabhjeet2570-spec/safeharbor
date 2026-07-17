@@ -2,6 +2,9 @@ import React, { useState, useEffect, useMemo } from 'react';
 import Header from './components/Header';
 import StatsCards from './components/StatsCards';
 import ThreatFeed from './components/ThreatFeed';
+import TrafficTimeline from './components/TrafficTimeline';
+import RiskHeatmap from './components/RiskHeatmap';
+import NetworkGraph from './components/NetworkGraph';
 import AuditLog from './components/AuditLog';
 import RedactionViewer from './components/RedactionViewer';
 import { fetchStats, fetchEvents } from './lib/api';
@@ -69,6 +72,17 @@ export default function App() {
             newEventIds={new Set()}
             onSelectEvent={setSelectedEvent}
           />
+        </div>
+
+        {/* Center: Charts */}
+        <div className="col-span-6 space-y-4">
+          <TrafficTimeline events={events} />
+          <RiskHeatmap events={events} />
+        </div>
+
+        {/* Right: Network Graph */}
+        <div className="col-span-3">
+          <NetworkGraph events={events} />
         </div>
       </div>
 
