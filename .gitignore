@@ -3,4 +3,5 @@ __pycache__/
 .claude/
 backend/__pycache__/
 dashboard/node_modules/
+dashboard/dist/
 .env
